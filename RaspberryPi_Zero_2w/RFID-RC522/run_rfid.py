@@ -183,9 +183,16 @@ def identify_card(tag_type):
     if tag_type is None:
         return "Unknown"
 
-    value = hex_bytes(tag_type)
+    if isinstance(tag_type, int):
+        return f"0x{tag_type:02X}"
 
-    return value
+    if isinstance(tag_type, (list, tuple, bytes, bytearray)):
+        return " ".join(
+            f"{byte:02X}"
+            for byte in tag_type
+        )
+
+    return str(tag_type)
 
 
 # ============================================================

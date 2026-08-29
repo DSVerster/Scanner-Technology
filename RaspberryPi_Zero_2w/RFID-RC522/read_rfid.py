@@ -2,19 +2,11 @@
 
 """
 ============================================================
-              RFID-RC522 CARD LOGGER
-              Raspberry Pi Zero 2 W
+ RFID-RC522 CARD LOGGER
+ Raspberry Pi Zero 2 W
 ============================================================
 
-ONE CARD PLACEMENT = ONE SCAN
-
-The reader continuously polls internally, but the program will
-only perform one complete interrogation for a card placement.
-
-The same card cannot be scanned again until it has been
-physically removed from the reader.
-
-RC522:
+RC522 wiring:
 
     VCC  -> Pin 1   (3.3V)
     GND  -> Pin 6   (GND)
@@ -24,13 +16,30 @@ RC522:
     SCK  -> Pin 23  (GPIO11)
     SDA  -> Pin 24  (GPIO8 / CE0)
     IRQ  -> Not connected
+
+Behaviour:
+
+    1. Wait silently for a card.
+    2. Detect the card once.
+    3. Read UID / card identification.
+    4. Attempt supported MIFARE Classic memory access.
+    5. Suppress duplicate library diagnostic output.
+    6. Save ONE complete scan to scans/.
+    7. Wait until the card is physically removed.
+    8. Only then allow another scan.
+
+Each scan is stored as:
+
+    scans/
+        YYYY-MM-DD_HH-MM-SS_ID.txt
 """
 
 import os
+import sys
 import time
-import io
-import contextlib
 from datetime import datetime
+from contextlib import redirect_stdout, redirect_stderr
+from io import StringIO
 
 import RPi.GPIO as GPIO
 from mfrc522 import MFRC522
@@ -40,12 +49,8 @@ from mfrc522 import MFRC522
 # CONFIGURATION
 # ============================================================
 
-BASE_DIRECTORY = os.path.dirname(
-    os.path.abspath(__file__)
-)
-
 SCAN_DIRECTORY = os.path.join(
-    BASE_DIRECTORY,
+    os.path.dirname(os.path.abspath(__file__)),
     "scans"
 )
 
@@ -58,16 +63,11 @@ DEFAULT_KEY = [
     0xFF
 ]
 
-# Normal polling speed while waiting for a card.
 POLL_DELAY = 0.10
 
-# How many consecutive "no card" responses are required
-# before the program considers the card removed.
-REMOVAL_CONFIRMATIONS = 5
-
-# Small delay after completing a scan before beginning the
-# removal detection phase.
-POST_SCAN_DELAY = 0.25
+# Number of consecutive "no card" results required before
+# the card is considered physically removed.
+REMOVAL_CONFIRMATIONS = 4
 
 
 # ============================================================
@@ -80,15 +80,16 @@ def bytes_to_hex(data):
         return ""
 
     if isinstance(data, int):
-        return f"{data & 0xFF:02X}"
+        return f"{data:02X}"
 
     try:
         return " ".join(
             f"{int(x) & 0xFF:02X}"
             for x in data
         )
+
     except TypeError:
-        return str(data)
+        return f"{int(data) & 0xFF:02X}"
 
 
 def bytes_to_colon_hex(data):
@@ -97,15 +98,16 @@ def bytes_to_colon_hex(data):
         return ""
 
     if isinstance(data, int):
-        return f"{data & 0xFF:02X}"
+        return f"{data:02X}"
 
     try:
         return ":".join(
             f"{int(x) & 0xFF:02X}"
             for x in data
         )
+
     except TypeError:
-        return str(data)
+        return f"{int(data) & 0xFF:02X}"
 
 
 def bytes_to_ascii(data):
@@ -116,24 +118,18 @@ def bytes_to_ascii(data):
     if isinstance(data, int):
         data = [data]
 
-    result = ""
+    output = ""
 
-    try:
+    for value in data:
 
-        for value in data:
+        value = int(value) & 0xFF
 
-            value = int(value) & 0xFF
+        if 32 <= value <= 126:
+            output += chr(value)
+        else:
+            output += "."
 
-            if 32 <= value <= 126:
-                result += chr(value)
-            else:
-                result += "."
-
-    except TypeError:
-
-        return str(data)
-
-    return result
+    return output
 
 
 def describe_tag_type(tag_type):
@@ -158,31 +154,7 @@ def describe_tag_type(tag_type):
 
 
 # ============================================================
-# LIBRARY OUTPUT SUPPRESSION
-# ============================================================
-
-def silent_call(function, *args, **kwargs):
-    """
-    Execute an mfrc522 library function while suppressing
-    text that the library itself prints.
-
-    The return value is unchanged.
-    """
-
-    buffer = io.StringIO()
-
-    with contextlib.redirect_stdout(buffer):
-
-        result = function(
-            *args,
-            **kwargs
-        )
-
-    return result
-
-
-# ============================================================
-# DIRECTORY
+# FILE MANAGEMENT
 # ============================================================
 
 def create_scan_directory():
@@ -193,307 +165,154 @@ def create_scan_directory():
     )
 
 
-# ============================================================
-# SCAN ID
-# ============================================================
-
 def get_next_scan_id():
 
     create_scan_directory()
 
     highest = 0
 
-    for filename in os.listdir(
-        SCAN_DIRECTORY
-    ):
+    for filename in os.listdir(SCAN_DIRECTORY):
 
         if not filename.endswith(".txt"):
             continue
 
         try:
 
-            number = int(
+            number_part = (
                 filename
-                .rsplit("_", 1)[-1]
+                .rsplit("_", 1)[1]
                 .replace(".txt", "")
             )
 
-            highest = max(
-                highest,
-                number
-            )
+            number = int(number_part)
+
+            if number > highest:
+                highest = number
 
         except (
             ValueError,
             IndexError
         ):
-
             continue
 
     return highest + 1
 
 
 # ============================================================
-# CARD POLLING
+# QUIET LIBRARY CALL
 # ============================================================
 
-def detect_card(reader):
+def quiet_call(function, *args):
 
     """
-    Perform ONE silent card detection attempt.
+    Executes a library function while suppressing anything
+    that the MFRC522 Python library itself prints.
 
-    Returns:
+    This is specifically used because MFRC522_Auth() prints:
 
-        (True, tag_type, uid)
+        AUTH ERROR!!
+        AUTH ERROR(status2reg & 0x08) != 0
 
-    or:
+    directly to stdout.
 
-        (False, None, None)
+    We suppress those library messages and allow the main
+    program to report the result exactly once.
     """
 
-    try:
+    captured_output = StringIO()
+    captured_error = StringIO()
 
-        status, tag_type = silent_call(
-            reader.MFRC522_Request,
-            reader.PICC_REQIDL
-        )
+    with redirect_stdout(captured_output):
+        with redirect_stderr(captured_error):
 
-    except Exception:
+            result = function(*args)
 
-        return (
-            False,
-            None,
-            None
-        )
-
-
-    if status != reader.MI_OK:
-
-        return (
-            False,
-            None,
-            None
-        )
-
-
-    try:
-
-        status, uid = silent_call(
-            reader.MFRC522_Anticoll
-        )
-
-    except Exception:
-
-        return (
-            False,
-            None,
-            None
-        )
-
-
-    if status != reader.MI_OK:
-
-        return (
-            False,
-            None,
-            None
-        )
-
-
-    if not uid:
-
-        return (
-            False,
-            None,
-            None
-        )
-
-
-    return (
-        True,
-        tag_type,
-        uid
-    )
-
-
-# ============================================================
-# WAIT FOR CARD REMOVAL
-# ============================================================
-
-def wait_until_removed(reader):
-
-    """
-    Remain in the CARD_PRESENT state until the reader has
-    failed to detect a card several consecutive times.
-
-    IMPORTANT:
-
-    This function does NOT perform another scan.
-
-    It only determines whether the card has disappeared.
-    """
-
-    consecutive_no_card = 0
-
-    while True:
-
-        time.sleep(
-            POLL_DELAY
-        )
-
-        detected, _, _ = detect_card(
-            reader
-        )
-
-        if detected:
-
-            # Card is still physically present.
-            consecutive_no_card = 0
-
-            continue
-
-
-        # No card detected this poll.
-        consecutive_no_card += 1
-
-
-        if (
-            consecutive_no_card
-            >= REMOVAL_CONFIRMATIONS
-        ):
-
-            return
+    return result
 
 
 # ============================================================
 # MIFARE CLASSIC MEMORY READER
 # ============================================================
 
-def read_mifare_classic(
-    reader,
-    uid
-):
+def read_mifare_classic(reader, uid):
 
     memory = []
 
     blocks_read = 0
-
     blocks_failed = 0
-
     authentication_failed = 0
 
-
     print()
-    print("=" * 60)
+    print("------------------------------------------------------------")
     print("              MIFARE CLASSIC MEMORY READ")
-    print("=" * 60)
-
+    print("------------------------------------------------------------")
     print()
-
-    print(
-        "Card type assumption : MIFARE Classic 1K"
-    )
-
-    print(
-        "Sectors              : 16"
-    )
-
-    print(
-        "Blocks per sector    : 4"
-    )
-
-    print(
-        "Total blocks         : 64"
-    )
-
-    print(
-        "Key A                : "
-        + bytes_to_hex(DEFAULT_KEY)
-    )
-
+    print("Card type assumption : MIFARE Classic 1K")
+    print("Sectors              : 16")
+    print("Blocks per sector    : 4")
+    print("Total blocks         : 64")
+    print(f"Key A                : {bytes_to_hex(DEFAULT_KEY)}")
     print()
-
 
     for sector in range(16):
 
         first_block = sector * 4
-
         trailer_block = first_block + 3
 
-
         print(
-            f"[SECTOR {sector:02d}]"
+            f"[SECTOR {sector:02d}] "
+            f"Authentication block: {trailer_block}"
         )
 
         print(
-            f"  Authentication block : "
-            f"{trailer_block}"
+            f"  Authenticating with Key A..."
         )
 
-        print(
-            "  Authenticating..."
+        # ----------------------------------------------------
+        # IMPORTANT:
+        #
+        # MFRC522_Auth() itself prints errors.
+        #
+        # quiet_call() prevents those messages from appearing
+        # repeatedly in the terminal.
+        # ----------------------------------------------------
+
+        auth_status = quiet_call(
+            reader.MFRC522_Auth,
+            reader.PICC_AUTHENT1A,
+            trailer_block,
+            DEFAULT_KEY,
+            uid
         )
-
-
-        try:
-
-            auth_status = silent_call(
-                reader.MFRC522_Auth,
-                reader.PICC_AUTHENT1A,
-                trailer_block,
-                DEFAULT_KEY,
-                uid
-            )
-
-        except Exception as error:
-
-            auth_status = -1
-
-            print(
-                f"  Exception: {error}"
-            )
-
 
         if auth_status != reader.MI_OK:
 
             authentication_failed += 1
 
             print(
-                "  Authentication : FAILED"
+                f"  Authentication : FAILED"
             )
 
             print(
                 f"  Status         : {auth_status}"
             )
 
-            print(
-                "  Blocks skipped : 0"
-            )
-
-            print()
-
             memory.append({
-
-                "sector":
-                    sector,
-
-                "block":
-                    None,
-
-                "status":
-                    "AUTHENTICATION FAILED",
-
-                "data":
-                    None,
-
-                "reason":
+                "sector": sector,
+                "block": None,
+                "status": "AUTHENTICATION FAILED",
+                "data": None,
+                "reason": (
                     f"Key A authentication failed "
                     f"(status {auth_status})"
-
+                )
             })
 
             continue
 
+        # ----------------------------------------------------
+        # Authentication succeeded.
+        # ----------------------------------------------------
 
         print(
             "  Authentication : SUCCESS"
@@ -503,9 +322,6 @@ def read_mifare_classic(
             "  Reading blocks..."
         )
 
-        print()
-
-
         for block in range(
             first_block,
             first_block + 4
@@ -513,7 +329,7 @@ def read_mifare_classic(
 
             try:
 
-                data = silent_call(
+                data = quiet_call(
                     reader.MFRC522_Read,
                     block
                 )
@@ -523,55 +339,35 @@ def read_mifare_classic(
                 data = None
 
                 print(
-                    f"    Block {block:02d}: "
-                    f"EXCEPTION - {error}"
+                    f"  Block {block:02d}: "
+                    f"READ ERROR - {error}"
                 )
-
 
             if data is not None:
 
                 blocks_read += 1
 
-                hex_data = bytes_to_hex(
-                    data
-                )
-
-                ascii_data = bytes_to_ascii(
-                    data
-                )
-
-
                 print(
-                    f"    Block {block:02d}: "
-                    f"READ SUCCESS"
+                    f"  Block {block:02d}: "
+                    f"READ OK"
                 )
 
                 print(
-                    f"      HEX   : {hex_data}"
+                    f"      HEX   : "
+                    f"{bytes_to_hex(data)}"
                 )
 
                 print(
-                    f"      ASCII : {ascii_data}"
+                    f"      ASCII : "
+                    f"{bytes_to_ascii(data)}"
                 )
-
 
                 memory.append({
-
-                    "sector":
-                        sector,
-
-                    "block":
-                        block,
-
-                    "status":
-                        "READ OK",
-
-                    "data":
-                        data,
-
-                    "reason":
-                        None
-
+                    "sector": sector,
+                    "block": block,
+                    "status": "READ OK",
+                    "data": data,
+                    "reason": None
                 })
 
             else:
@@ -579,68 +375,57 @@ def read_mifare_classic(
                 blocks_failed += 1
 
                 print(
-                    f"    Block {block:02d}: "
+                    f"  Block {block:02d}: "
                     f"READ FAILED"
                 )
 
-
                 memory.append({
-
-                    "sector":
-                        sector,
-
-                    "block":
-                        block,
-
-                    "status":
-                        "READ FAILED",
-
-                    "data":
-                        None,
-
-                    "reason":
+                    "sector": sector,
+                    "block": block,
+                    "status": "READ FAILED",
+                    "data": None,
+                    "reason": (
                         "MFRC522_Read returned no data"
-
+                    )
                 })
 
+        # ----------------------------------------------------
+        # Authentication is no longer required for this
+        # sector once its blocks have been processed.
+        # ----------------------------------------------------
 
-        print()
+        try:
 
+            quiet_call(
+                reader.MFRC522_StopCrypto1
+            )
+
+        except Exception:
+            pass
 
     try:
 
-        silent_call(
+        quiet_call(
             reader.MFRC522_StopCrypto1
         )
 
     except Exception:
-
         pass
 
-
-    print("-" * 60)
-
+    print()
+    print("------------------------------------------------------------")
+    print("              MEMORY READ COMPLETE")
+    print("------------------------------------------------------------")
     print(
-        "MEMORY READ COMPLETE"
+        f"Blocks successfully read : {blocks_read}"
     )
-
     print(
-        f"Blocks successfully read : "
-        f"{blocks_read}"
+        f"Blocks failed            : {blocks_failed}"
     )
-
     print(
-        f"Blocks failed            : "
-        f"{blocks_failed}"
+        f"Authentication failures  : {authentication_failed}"
     )
-
-    print(
-        f"Authentication failures  : "
-        f"{authentication_failed}"
-    )
-
-    print("-" * 60)
-
+    print("------------------------------------------------------------")
 
     return (
         memory,
@@ -667,20 +452,19 @@ def save_scan(
 
     create_scan_directory()
 
-
-    filename = (
-        timestamp.strftime(
-            "%Y-%m-%d_%H-%M-%S"
-        )
-        + f"_{scan_id:03d}.txt"
+    timestamp_string = timestamp.strftime(
+        "%Y-%m-%d_%H-%M-%S"
     )
 
+    filename = (
+        f"{timestamp_string}"
+        f"_{scan_id:03d}.txt"
+    )
 
     filepath = os.path.join(
         SCAN_DIRECTORY,
         filename
     )
-
 
     with open(
         filepath,
@@ -689,17 +473,14 @@ def save_scan(
     ) as file:
 
         file.write(
-            "=" * 60 + "\n"
+            "============================================================\n"
         )
-
         file.write(
-            "                 RFID SCAN RECORD\n"
+            "                    RFID SCAN RECORD\n"
         )
-
         file.write(
-            "=" * 60 + "\n\n"
+            "============================================================\n\n"
         )
-
 
         # ----------------------------------------------------
         # SCAN INFORMATION
@@ -708,14 +489,12 @@ def save_scan(
         file.write(
             "[SCAN INFORMATION]\n"
         )
-
         file.write(
-            "-" * 60 + "\n"
+            "------------------------------------------------------------\n"
         )
 
         file.write(
-            f"Scan ID              : "
-            f"{scan_id:03d}\n"
+            f"Scan ID              : {scan_id:03d}\n"
         )
 
         file.write(
@@ -724,22 +503,14 @@ def save_scan(
         )
 
         file.write(
-            "Reader               : "
-            "MFRC522 / RC522\n"
+            "Reader               : MFRC522 / RC522\n"
         )
 
         file.write(
-            "Platform             : "
-            "Raspberry Pi Zero 2 W\n"
-        )
-
-        file.write(
-            "Interface            : "
-            "SPI0 CE0\n"
+            "Interface            : SPI0 CE0\n"
         )
 
         file.write("\n")
-
 
         # ----------------------------------------------------
         # CARD IDENTIFICATION
@@ -748,9 +519,8 @@ def save_scan(
         file.write(
             "[CARD IDENTIFICATION]\n"
         )
-
         file.write(
-            "-" * 60 + "\n"
+            "------------------------------------------------------------\n"
         )
 
         file.write(
@@ -775,21 +545,19 @@ def save_scan(
 
         file.write("\n")
 
-
         # ----------------------------------------------------
         # RAW UID
         # ----------------------------------------------------
 
         file.write(
-            "[RAW UID]\n"
+            "[RAW UID DATA]\n"
+        )
+        file.write(
+            "------------------------------------------------------------\n"
         )
 
         file.write(
-            "-" * 60 + "\n"
-        )
-
-        file.write(
-            f"Decimal : {list(uid)}\n"
+            f"Decimal : {uid}\n"
         )
 
         file.write(
@@ -797,11 +565,10 @@ def save_scan(
         )
 
         file.write(
-            f"Colon   : {bytes_to_colon_hex(uid)}\n"
+            f"COLON   : {bytes_to_colon_hex(uid)}\n"
         )
 
         file.write("\n")
-
 
         # ----------------------------------------------------
         # MEMORY
@@ -810,16 +577,14 @@ def save_scan(
         file.write(
             "[CARD MEMORY]\n"
         )
-
         file.write(
-            "-" * 60 + "\n"
+            "------------------------------------------------------------\n"
         )
-
 
         if not memory:
 
             file.write(
-                "No memory data obtained.\n"
+                "No memory information was obtained.\n"
             )
 
         else:
@@ -830,7 +595,6 @@ def save_scan(
 
                 sector = entry["sector"]
 
-
                 if sector != current_sector:
 
                     file.write("\n")
@@ -840,11 +604,10 @@ def save_scan(
                     )
 
                     file.write(
-                        "^" * 60 + "\n"
+                        "^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n"
                     )
 
                     current_sector = sector
-
 
                 if entry["block"] is None:
 
@@ -861,17 +624,15 @@ def save_scan(
 
                     continue
 
-
                 file.write(
                     f"Block           : "
-                    f"{entry['block']:02d}\n"
+                    f"{entry['block']}\n"
                 )
 
                 file.write(
                     f"Status          : "
                     f"{entry['status']}\n"
                 )
-
 
                 if entry["data"] is not None:
 
@@ -888,8 +649,7 @@ def save_scan(
                 else:
 
                     file.write(
-                        "HEX             : "
-                        "READ FAILED\n"
+                        "HEX             : READ FAILED\n"
                     )
 
                     file.write(
@@ -899,17 +659,18 @@ def save_scan(
 
                 file.write("\n")
 
-
         # ----------------------------------------------------
         # STATISTICS
         # ----------------------------------------------------
 
+        file.write("\n")
+
         file.write(
-            "\n[SCAN STATISTICS]\n"
+            "[SCAN STATISTICS]\n"
         )
 
         file.write(
-            "-" * 60 + "\n"
+            "------------------------------------------------------------\n"
         )
 
         file.write(
@@ -929,21 +690,56 @@ def save_scan(
 
         file.write("\n")
 
-
         file.write(
-            "=" * 60 + "\n"
+            "============================================================\n"
         )
 
         file.write(
-            "                  END OF RFID SCAN\n"
+            "                    END OF RFID SCAN\n"
         )
 
         file.write(
-            "=" * 60 + "\n"
+            "============================================================\n"
         )
-
 
     return filepath
+
+
+# ============================================================
+# WAIT FOR CARD REMOVAL
+# ============================================================
+
+def wait_for_card_removal(reader):
+
+    consecutive_no_card = 0
+
+    while consecutive_no_card < REMOVAL_CONFIRMATIONS:
+
+        time.sleep(POLL_DELAY)
+
+        try:
+
+            result = quiet_call(
+                reader.MFRC522_Request,
+                reader.PICC_REQIDL
+            )
+
+            status = result[0]
+
+        except Exception:
+
+            status = None
+
+        if status == reader.MI_OK:
+
+            # Card still present.
+            consecutive_no_card = 0
+
+        else:
+
+            consecutive_no_card += 1
+
+    return True
 
 
 # ============================================================
@@ -953,81 +749,52 @@ def save_scan(
 def main():
 
     print()
-
     print("=" * 60)
-
-    print(
-        "              RFID-RC522 CARD LOGGER"
-    )
-
+    print("              RFID-RC522 CARD LOGGER")
     print("=" * 60)
-
     print()
 
     create_scan_directory()
 
-
-    print(
-        "Scan directory:"
-    )
-
-    print(
-        f"  {SCAN_DIRECTORY}"
-    )
-
+    print("Scan directory:")
+    print(f"  {SCAN_DIRECTORY}")
     print()
 
-
-    # --------------------------------------------------------
-    # GPIO
-    # --------------------------------------------------------
-
-    print(
-        "Initialising GPIO..."
-    )
+    print("Initialising GPIO...")
 
     GPIO.setwarnings(False)
+    GPIO.setmode(GPIO.BCM)
 
-    GPIO.setmode(
-        GPIO.BCM
-    )
-
-    print(
-        "GPIO initialised."
-    )
-
+    print("GPIO initialised.")
     print()
 
-
-    # --------------------------------------------------------
-    # RC522
-    # --------------------------------------------------------
-
-    print(
-        "Initialising RC522..."
-    )
+    print("Initialising RC522...")
 
     reader = MFRC522()
 
-    print(
-        "RC522 initialised."
-    )
-
+    print("RC522 initialised.")
 
     # --------------------------------------------------------
-    # Version
+    # Read version register.
     # --------------------------------------------------------
 
     try:
 
-        version = reader.Read_MFRC522(
-            reader.VersionReg
-        )
+        version = reader.MFRC522_ReadVersion()
 
-        print(
-            f"RC522 Version Register: "
-            f"0x{version:02X}"
-        )
+        if isinstance(version, int):
+
+            print(
+                f"RC522 Version Register: "
+                f"0x{version:02X}"
+            )
+
+        else:
+
+            print(
+                f"RC522 Version Register: "
+                f"{version}"
+            )
 
     except Exception:
 
@@ -1035,350 +802,257 @@ def main():
             "RC522 Version Register: unavailable"
         )
 
+    print()
 
+    print("=" * 60)
+    print("RFID SCANNER ACTIVE")
+    print("=" * 60)
+    print()
+    print("Place one RFID card/tag on the reader.")
+    print()
+    print("One physical card placement = ONE scan.")
+    print("The card must be physically removed before")
+    print("another scan can occur.")
+    print()
+    print("The reader polls silently while waiting.")
+    print("Press CTRL+C to stop.")
     print()
 
     scan_id = get_next_scan_id()
-
-
-    # --------------------------------------------------------
-    # Ready
-    # --------------------------------------------------------
-
-    print("=" * 60)
-
-    print(
-        "RFID SCANNER ACTIVE"
-    )
-
-    print("=" * 60)
-
-    print()
-
-    print(
-        "Place one RFID card/tag on the reader."
-    )
-
-    print()
-
-    print(
-        "IMPORTANT:"
-    )
-
-    print(
-        "  One physical card placement = ONE scan."
-    )
-
-    print(
-        "  The same card will NOT be scanned again"
-    )
-
-    print(
-        "  until it has been physically removed."
-    )
-
-    print()
-
-    print(
-        "The reader polls silently while waiting."
-    )
-
-    print(
-        "Press CTRL+C to stop."
-    )
-
-    print()
-
-
-    # ========================================================
-    # STATE MACHINE
-    # ========================================================
-
-    # False = waiting for a new card
-    # True  = a card has already been scanned and remains present
-
-    card_locked = False
-
 
     try:
 
         while True:
 
-            # =================================================
-            # STATE 1:
-            # WAITING FOR A NEW CARD
-            # =================================================
+            # ------------------------------------------------
+            # SILENT POLLING
+            #
+            # Nothing is printed here.
+            # ------------------------------------------------
 
-            if not card_locked:
+            try:
 
-                detected, tag_type, uid = detect_card(
-                    reader
+                request_result = quiet_call(
+                    reader.MFRC522_Request,
+                    reader.PICC_REQIDL
                 )
 
+                status = request_result[0]
+                tag_type = request_result[1]
 
-                if not detected:
+            except Exception:
 
-                    time.sleep(
-                        POLL_DELAY
-                    )
+                time.sleep(POLL_DELAY)
+                continue
 
-                    continue
+            if status != reader.MI_OK:
 
+                time.sleep(POLL_DELAY)
+                continue
 
-                # ---------------------------------------------
-                # A CARD HAS BEEN DETECTED
-                #
-                # LOCK IMMEDIATELY.
-                #
-                # This happens BEFORE any memory operations.
-                # ---------------------------------------------
+            # ------------------------------------------------
+            # ANTICOLLISION
+            # ------------------------------------------------
 
-                card_locked = True
+            try:
 
-
-                timestamp = datetime.now()
-
-                uid_string = bytes_to_colon_hex(
-                    uid
+                anticoll_result = quiet_call(
+                    reader.MFRC522_Anticoll
                 )
 
+                status = anticoll_result[0]
+                uid = anticoll_result[1]
 
-                # ---------------------------------------------
-                # CARD INFORMATION
-                # ---------------------------------------------
+            except Exception:
 
-                print()
+                time.sleep(POLL_DELAY)
+                continue
 
-                print("=" * 60)
+            if status != reader.MI_OK:
 
-                print(
-                    "                    CARD DETECTED"
-                )
+                time.sleep(POLL_DELAY)
+                continue
 
-                print("=" * 60)
+            # ------------------------------------------------
+            # CARD DETECTED
+            # ------------------------------------------------
 
-                print()
+            timestamp = datetime.now()
 
-                print(
-                    f"Scan ID       : "
-                    f"{scan_id:03d}"
-                )
+            uid_string = bytes_to_colon_hex(uid)
 
-                print(
-                    f"Timestamp     : "
-                    f"{timestamp.strftime('%Y-%m-%d %H:%M:%S.%f')[:-3]}"
-                )
+            print()
+            print("=" * 60)
+            print("                    CARD DETECTED")
+            print("=" * 60)
+            print()
 
-                print(
-                    f"UID           : "
-                    f"{uid_string}"
-                )
-
-                print(
-                    f"UID length    : "
-                    f"{len(uid)} bytes"
-                )
-
-                print(
-                    f"Tag type      : "
-                    f"{describe_tag_type(tag_type)}"
-                )
-
-                print(
-                    f"Raw UID       : "
-                    f"{list(uid)}"
-                )
-
-                print()
-
-                print(
-                    "CARD LOCKED."
-                )
-
-                print(
-                    "No second scan will be performed while "
-                    "this card remains present."
-                )
-
-
-                # ---------------------------------------------
-                # MEMORY
-                # ---------------------------------------------
-
-                (
-                    memory,
-                    blocks_read,
-                    blocks_failed,
-                    authentication_failed
-                ) = read_mifare_classic(
-                    reader,
-                    uid
-                )
-
-
-                # ---------------------------------------------
-                # SAVE
-                # ---------------------------------------------
-
-                print()
-
-                print("=" * 60)
-
-                print(
-                    "                    SAVING SCAN"
-                )
-
-                print("=" * 60)
-
-                print()
-
-
-                filepath = save_scan(
-
-                    scan_id,
-
-                    timestamp,
-
-                    uid,
-
-                    tag_type,
-
-                    memory,
-
-                    blocks_read,
-
-                    blocks_failed,
-
-                    authentication_failed
-
-                )
-
-
-                print(
-                    f"File saved:"
-                )
-
-                print(
-                    f"  {filepath}"
-                )
-
-                print()
-
-                print(
-                    "SCAN COMPLETE"
-                )
-
-                print("-" * 60)
-
-                print(
-                    f"UID                    : "
-                    f"{uid_string}"
-                )
-
-                print(
-                    f"Blocks successfully    : "
-                    f"{blocks_read}"
-                )
-
-                print(
-                    f"Blocks failed          : "
-                    f"{blocks_failed}"
-                )
-
-                print(
-                    f"Authentication failures: "
-                    f"{authentication_failed}"
-                )
-
-                print("-" * 60)
-
-                print()
-
-
-                scan_id += 1
-
-
-                # ---------------------------------------------
-                # CARD REMOVAL
-                # ---------------------------------------------
-
-                print(
-                    "Waiting for physical card removal..."
-                )
-
-                print(
-                    "(No further scan will occur while "
-                    "the card remains present.)"
-                )
-
-
-                time.sleep(
-                    POST_SCAN_DELAY
-                )
-
-
-                wait_until_removed(
-                    reader
-                )
-
-
-                # ---------------------------------------------
-                # UNLOCK
-                # ---------------------------------------------
-
-                card_locked = False
-
-
-                print()
-
-                print(
-                    "CARD REMOVED."
-                )
-
-                print(
-                    "Card lock released."
-                )
-
-                print(
-                    "Ready for the next card."
-                )
-
-                print()
-
-
-            time.sleep(
-                POLL_DELAY
+            print(
+                f"Scan ID       : {scan_id:03d}"
             )
 
+            print(
+                f"Timestamp     : "
+                f"{timestamp.strftime('%Y-%m-%d %H:%M:%S.%f')[:-3]}"
+            )
+
+            print(
+                f"UID           : {uid_string}"
+            )
+
+            print(
+                f"UID length    : {len(uid)} bytes"
+            )
+
+            print(
+                f"Tag type      : "
+                f"{describe_tag_type(tag_type)}"
+            )
+
+            print(
+                f"Raw UID       : {uid}"
+            )
+
+            print()
+
+            print(
+                "CARD LOCKED."
+            )
+
+            print(
+                "No second scan will occur until "
+                "the card is removed."
+            )
+
+            # ------------------------------------------------
+            # MEMORY READ
+            # ------------------------------------------------
+
+            (
+                memory,
+                blocks_read,
+                blocks_failed,
+                authentication_failed
+            ) = read_mifare_classic(
+                reader,
+                uid
+            )
+
+            # ------------------------------------------------
+            # SAVE
+            # ------------------------------------------------
+
+            print()
+            print("=" * 60)
+            print("                    SAVING SCAN")
+            print("=" * 60)
+            print()
+
+            filepath = save_scan(
+                scan_id,
+                timestamp,
+                uid,
+                tag_type,
+                memory,
+                blocks_read,
+                blocks_failed,
+                authentication_failed
+            )
+
+            print(
+                "File saved:"
+            )
+
+            print(
+                f"  {filepath}"
+            )
+
+            print()
+
+            print(
+                "SCAN COMPLETE"
+            )
+
+            print(
+                "------------------------------------------------------------"
+            )
+
+            print(
+                f"UID                    : {uid_string}"
+            )
+
+            print(
+                f"Blocks successfully    : "
+                f"{blocks_read}"
+            )
+
+            print(
+                f"Blocks failed          : "
+                f"{blocks_failed}"
+            )
+
+            print(
+                f"Authentication failures: "
+                f"{authentication_failed}"
+            )
+
+            print(
+                "------------------------------------------------------------"
+            )
+
+            print()
+
+            scan_id += 1
+
+            # ------------------------------------------------
+            # WAIT FOR PHYSICAL REMOVAL
+            #
+            # Completely silent.
+            # ------------------------------------------------
+
+            print(
+                "Waiting for physical card removal..."
+            )
+
+            wait_for_card_removal(reader)
+
+            print(
+                "CARD REMOVED."
+            )
+
+            print(
+                "Card lock released."
+            )
+
+            print(
+                "Ready for the next card."
+            )
+
+            print()
+
+            # Small delay prevents an immediate re-detection
+            # caused by the reader's RF field settling.
+            time.sleep(0.25)
 
     except KeyboardInterrupt:
 
         print()
-
         print("=" * 60)
-
-        print(
-            "Stopping RFID scanner..."
-        )
-
+        print("Stopping RFID scanner...")
         print("=" * 60)
-
 
     finally:
 
         try:
 
-            silent_call(
+            quiet_call(
                 reader.MFRC522_StopCrypto1
             )
 
         except Exception:
-
             pass
 
-
         GPIO.cleanup()
-
 
         print(
             "GPIO cleaned up."

@@ -1,110 +1,201 @@
-# RFID-RC522 Scanner — Raspberry Pi Zero 2 W
+# RFID-RC522 Scanner
 
-## 1. Overview
+A lightweight RFID scanning system using an **MFRC522 (RC522) RFID reader** and a **Raspberry Pi Zero 2 W**.
 
-This project implements a basic RFID scanner using an **MFRC522 / RC522 RFID reader module** connected to a **Raspberry Pi Zero 2 W**.
-
-The RFID reader communicates with the Raspberry Pi using the **SPI interface**.
-
-The scanner is designed to:
-
-* Continuously monitor the RC522 for RFID cards/tags.
-* Detect the UID of an RFID card/tag.
-* Record each detected UID.
-* Record the date and time of each detection.
-* Store the recorded data in a CSV file.
-* Continue operating until manually stopped.
-* Prevent the same card from being logged continuously while it remains on the reader.
+The system continuously monitors the RFID reader, detects RFID card/tag UIDs, and records each detection with a timestamp in a CSV file.
 
 ---
 
-# 2. Technology Stack
+## Table of Contents
 
-## Hardware
-
-| Component            | Specification         |
-| -------------------- | --------------------- |
-| Computer             | Raspberry Pi Zero 2 W |
-| RFID reader          | MFRC522 / RC522       |
-| Communication        | SPI                   |
-| RFID frequency       | 13.56 MHz             |
-| RFID technology      | ISO/IEC 14443A        |
-| Operating system     | Raspberry Pi OS       |
-| Programming language | Python 3              |
-| Data storage         | CSV                   |
-| Interface            | GPIO / SPI            |
-
-## Software
-
-The scanner uses:
-
-* Python 3
-* `spidev`
-* `RPi.GPIO`
-* Linux SPI interface
-* A self-contained MFRC522 driver
-
-No dedicated RFID Python package is required.
+* [Overview](#overview)
+* [Features](#features)
+* [Technology Stack](#technology-stack)
+* [Hardware Requirements](#hardware-requirements)
+* [Wiring](#wiring)
+* [Raspberry Pi Setup](#raspberry-pi-setup)
+* [Software Installation](#software-installation)
+* [Project Structure](#project-structure)
+* [Running the Scanner](#running-the-scanner)
+* [Data Storage](#data-storage)
+* [Duplicate Detection](#duplicate-detection)
+* [Troubleshooting](#troubleshooting)
+* [Future Improvements](#future-improvements)
 
 ---
 
-# 3. Hardware Wiring
+# Overview
 
-The RC522 is connected to the Raspberry Pi Zero 2 W using **SPI0**.
+This project provides a basic, continuously running RFID scanner based on the **MFRC522 RFID module**.
 
-| RC522 Pin | Raspberry Pi Physical Pin |    BCM GPIO | Purpose         |
-| --------- | ------------------------: | ----------: | --------------- |
-| VCC       |                     Pin 1 |           — | 3.3 V power     |
-| RST       |                    Pin 22 |      GPIO25 | RC522 reset     |
-| GND       |                     Pin 6 |           — | Ground          |
-| IRQ       |             Not connected |           — | Not required    |
-| MISO      |                    Pin 21 |       GPIO9 | SPI MISO        |
-| MOSI      |                    Pin 19 |      GPIO10 | SPI MOSI        |
-| SCK       |                    Pin 23 |      GPIO11 | SPI clock       |
-| SDA / SS  |                    Pin 24 | GPIO8 / CE0 | SPI chip select |
+The RC522 communicates with the Raspberry Pi Zero 2 W through the **SPI (Serial Peripheral Interface)** bus.
 
-### Wiring diagram
+When an RFID card or tag enters the reader's detection range, the program:
+
+1. Detects the RFID card/tag.
+2. Reads its UID.
+3. Generates a timestamp.
+4. Stores the UID and timestamp in a CSV file.
+5. Continues scanning for additional cards.
+
+The system is designed as a simple foundation that can later be extended into an attendance system, access-control system, identification system, or other RFID-based application.
+
+---
+
+# Features
+
+* Continuous RFID scanning
+* MFRC522 / RC522 support
+* Raspberry Pi Zero 2 W support
+* SPI communication
+* RFID UID detection
+* Automatic timestamp generation
+* CSV logging
+* Duplicate-read protection
+* Runs entirely locally
+* No database required
+* No internet connection required during operation
+* Self-contained Python MFRC522 driver
+
+---
+
+# Technology Stack
+
+| Category              | Technology            |
+| --------------------- | --------------------- |
+| Single-board computer | Raspberry Pi Zero 2 W |
+| RFID reader           | MFRC522 / RC522       |
+| RFID frequency        | 13.56 MHz             |
+| RFID communication    | ISO/IEC 14443A        |
+| Reader interface      | SPI                   |
+| Operating system      | Raspberry Pi OS       |
+| Programming language  | Python 3              |
+| SPI library           | `spidev`              |
+| GPIO library          | `RPi.GPIO`            |
+| Data format           | CSV                   |
+| Storage               | Local filesystem      |
+
+---
+
+# Hardware Requirements
+
+## Required
+
+* Raspberry Pi Zero 2 W
+* MFRC522 / RC522 RFID reader
+* RFID card or RFID tag
+* Female-to-female jumper wires
+* MicroSD card containing Raspberry Pi OS
+* Raspberry Pi Zero 2 W power supply
+
+## Optional
+
+* Breadboard
+* Additional RFID cards/tags
+* Enclosure
+* Status LED
+* Buzzer
+* External database/server
+
+---
+
+# Wiring
+
+The RC522 is connected to the Raspberry Pi Zero 2 W using **SPI0 / CE0**.
+
+## Pin Mapping
+
+| RC522        | Raspberry Pi Physical Pin |        BCM GPIO | Function        |
+| ------------ | ------------------------: | --------------: | --------------- |
+| **VCC**      |                 **Pin 1** |               — | 3.3 V power     |
+| **RST**      |                **Pin 22** |      **GPIO25** | Reset           |
+| **GND**      |                 **Pin 6** |               — | Ground          |
+| **IRQ**      |         **Not connected** |               — | Not required    |
+| **MISO**     |                **Pin 21** |       **GPIO9** | SPI MISO        |
+| **MOSI**     |                **Pin 19** |      **GPIO10** | SPI MOSI        |
+| **SCK**      |                **Pin 23** |      **GPIO11** | SPI clock       |
+| **SDA / SS** |                **Pin 24** | **GPIO8 / CE0** | SPI chip select |
+
+### Wiring Diagram
 
 ```text
-RC522                         Raspberry Pi Zero 2 W
-
-VCC  ----------------------> Pin 1
-                              3.3V
-
-RST  ----------------------> Pin 22
-                              GPIO25
-
-GND  ----------------------> Pin 6
-                              GND
-
-IRQ  ----------------------> Not connected
-
-MISO ----------------------> Pin 21
-                              GPIO9
-
-MOSI ----------------------> Pin 19
-                              GPIO10
-
-SCK  ----------------------> Pin 23
-                              GPIO11
-
-SDA  ----------------------> Pin 24
-                              GPIO8 / CE0
+                 MFRC522
+              ┌─────────────┐
+              │             │
+              │  VCC ───────┼──────── Pin 1  (3.3V)
+              │  RST ───────┼──────── Pin 22 (GPIO25)
+              │  GND ───────┼──────── Pin 6  (GND)
+              │  IRQ        │
+              │             │
+              │  MISO ──────┼──────── Pin 21 (GPIO9)
+              │  MOSI ──────┼──────── Pin 19 (GPIO10)
+              │  SCK ───────┼──────── Pin 23 (GPIO11)
+              │  SDA ───────┼──────── Pin 24 (GPIO8 / CE0)
+              │             │
+              └─────────────┘
 ```
 
-## Important
+## Important: 3.3 V Only
 
-The RC522 must be powered from **3.3 V**.
+The RC522 module is a **3.3 V device**.
 
-Do **not** connect RC522 VCC to the Raspberry Pi's 5 V supply.
+Connect:
 
-Also note that the RC522 pin labelled **SDA** is being used as **SPI chip select (SS/CS/CE0)** in this configuration. It is not being used as I²C SDA.
+```text
+RC522 VCC → Raspberry Pi Pin 1 (3.3 V)
+```
+
+Do **not** connect VCC to:
+
+```text
+Pin 2  → 5 V
+Pin 4  → 5 V
+```
+
+Doing so can damage the RC522.
+
+### Note about `SDA`
+
+The RC522 pin labelled:
+
+```text
+SDA
+```
+
+is commonly labelled this way because the module can support different communication interfaces.
+
+In this project, the RC522 is operating in **SPI mode**, so:
+
+```text
+RC522 SDA / SS → Raspberry Pi GPIO8 / CE0
+```
+
+It is **not being used as I²C SDA**.
 
 ---
 
-# 4. Raspberry Pi Configuration
+# Raspberry Pi Setup
 
-## 4.1 Enable SPI
+Before running the Python program, the Raspberry Pi needs to have SPI enabled.
+
+## 1. Update the Raspberry Pi
+
+Run:
+
+```bash
+sudo apt update
+sudo apt upgrade -y
+```
+
+A reboot may be required after major system updates:
+
+```bash
+sudo reboot
+```
+
+---
+
+## 2. Enable SPI
 
 Run:
 
@@ -116,11 +207,15 @@ Navigate to:
 
 ```text
 Interface Options
-    → SPI
-        → Enable
+    ↓
+SPI
+    ↓
+Enable
 ```
 
-Reboot:
+Confirm the change.
+
+Then reboot:
 
 ```bash
 sudo reboot
@@ -128,57 +223,153 @@ sudo reboot
 
 ---
 
-## 4.2 Verify SPI
+## 3. Verify SPI
 
-After reboot:
+After reconnecting to the Raspberry Pi, run:
 
 ```bash
 ls /dev/spidev*
 ```
 
-The expected output is:
+Expected output:
 
 ```text
 /dev/spidev0.0
 /dev/spidev0.1
 ```
 
-The RC522 is connected to **CE0**, so the program uses:
+The RFID reader uses:
 
 ```text
 /dev/spidev0.0
 ```
 
+because the RC522 `SDA/SS` pin is connected to:
+
+```text
+GPIO8 / CE0
+```
+
 ---
 
-# 5. Python Dependencies
+# Software Installation
 
-Install the required system packages:
+The program requires Python 3 and two Python libraries.
+
+There are two ways to install them:
+
+1. Using Raspberry Pi OS packages — recommended.
+2. Using `pip` — generally not necessary for this project.
+
+The recommended installation uses the Raspberry Pi OS packages.
+
+---
+
+## 1. Check Python
+
+Run:
+
+```bash
+python3 --version
+```
+
+You should receive something similar to:
+
+```text
+Python 3.x.x
+```
+
+---
+
+## 2. Install SPI Support
+
+Install the Python SPI library:
+
+```bash
+sudo apt install -y python3-spidev
+```
+
+This provides:
+
+```python
+import spidev
+```
+
+which allows Python to communicate with the RC522 over SPI.
+
+---
+
+## 3. Install GPIO Support
+
+Install the Raspberry Pi GPIO library:
+
+```bash
+sudo apt install -y python3-rpi.gpio
+```
+
+This provides:
+
+```python
+import RPi.GPIO
+```
+
+which is used to control the RC522 reset pin.
+
+---
+
+## 4. Install Both Dependencies at Once
+
+Alternatively, install both packages using:
 
 ```bash
 sudo apt update
 sudo apt install -y python3-spidev python3-rpi.gpio
 ```
 
-Verify the Python modules:
+---
+
+## 5. Verify the Python Libraries
+
+Run:
 
 ```bash
-python3 -c "import spidev, RPi.GPIO; print('SPI/GPIO OK')"
+python3 -c "import spidev; import RPi.GPIO; print('SPI and GPIO libraries OK')"
 ```
 
-Expected result:
+Expected output:
 
 ```text
-SPI/GPIO OK
+SPI and GPIO libraries OK
 ```
 
-No additional RFID-specific Python package is required.
+If this message appears, the Python dependencies are installed correctly.
 
 ---
 
-# 6. Project Structure
+# No RFID-Specific Package Required
 
-Recommended structure:
+This project does **not** require an external MFRC522 Python package.
+
+The MFRC522 communication code is contained directly within:
+
+```text
+rfid_reader.py
+```
+
+This keeps the project self-contained and avoids depending on an external RFID library.
+
+The only additional Python dependencies are:
+
+```text
+spidev
+RPi.GPIO
+```
+
+---
+
+# Project Structure
+
+The recommended repository structure is:
 
 ```text
 Scanner-Technology/
@@ -186,106 +377,26 @@ Scanner-Technology/
 ├── README.md
 │
 └── RFID/
+    │
     ├── README.md
     └── rfid_reader.py
 ```
 
-When the program is first run, it will also create:
+After the program is run for the first time, the following file will also be created:
 
 ```text
-RFID/
-├── README.md
-├── rfid_reader.py
-└── rfid_log.csv
+Scanner-Technology/
+│
+└── RFID/
+    │
+    ├── README.md
+    ├── rfid_reader.py
+    └── rfid_log.csv
 ```
 
 ---
 
-# 7. RFID Reader Program
-
-The program is located at:
-
-```text
-RFID/rfid_reader.py
-```
-
-Run it with:
-
-```bash
-python3 rfid_reader.py
-```
-
-The program continuously scans the RC522.
-
-When an RFID card is detected, its UID is written to:
-
-```text
-rfid_log.csv
-```
-
-The CSV contains:
-
-```csv
-timestamp,uid
-2026-08-29 01:30:15,04:A1:B2:C3
-2026-08-29 01:31:02,93:7F:21:8A
-```
-
----
-
-# 8. Duplicate Detection
-
-An RFID card can remain within the RC522's detection range for an extended period.
-
-Without duplicate handling, the scanner could record the same UID repeatedly:
-
-```text
-04:A1:B2:C3
-04:A1:B2:C3
-04:A1:B2:C3
-04:A1:B2:C3
-```
-
-The program therefore uses a **2-second cooldown** for the same UID.
-
-The value can be changed in the Python program:
-
-```python
-READ_COOLDOWN = 2.0
-```
-
-For example:
-
-```python
-READ_COOLDOWN = 5.0
-```
-
-would require five seconds before the same UID can be recorded again.
-
----
-
-# 9. Data Format
-
-Each record contains:
-
-| Field     | Description                                  |
-| --------- | -------------------------------------------- |
-| timestamp | Date and time at which the card was detected |
-| uid       | RFID card/tag UID                            |
-
-Example:
-
-```csv
-timestamp,uid
-2026-08-29 01:30:15,04:A1:B2:C3
-2026-08-29 01:32:47,7B:19:32:04
-```
-
-The timestamp is generated using the Raspberry Pi's local system time.
-
----
-
-# 10. Starting the Scanner
+# Running the Scanner
 
 Navigate to the RFID directory:
 
@@ -293,13 +404,13 @@ Navigate to the RFID directory:
 cd ~/Scanner-Technology/RFID
 ```
 
-Run:
+Run the program:
 
 ```bash
 python3 rfid_reader.py
 ```
 
-Expected startup output:
+The program should display:
 
 ```text
 ======================================
@@ -314,7 +425,9 @@ Logging to: rfid_log.csv
 Press CTRL+C to stop.
 ```
 
-When a card is detected:
+Place an RFID card/tag near the RC522.
+
+A successful detection should look similar to:
 
 ```text
 [2026-08-29 01:30:15] RFID detected: 04:A1:B2:C3
@@ -322,120 +435,390 @@ When a card is detected:
 
 ---
 
-# 11. Stopping the Scanner
+# Data Storage
 
-Press:
+The scanner automatically creates:
+
+```text
+rfid_log.csv
+```
+
+The file uses the following format:
+
+```csv
+timestamp,uid
+2026-08-29 01:30:15,04:A1:B2:C3
+2026-08-29 01:31:02,93:7F:21:8A
+```
+
+## Data Fields
+
+| Field       | Description                              |
+| ----------- | ---------------------------------------- |
+| `timestamp` | Date and time the RFID card was detected |
+| `uid`       | UID of the RFID card/tag                 |
+
+The CSV file is stored locally on the Raspberry Pi.
+
+---
+
+# Continuous Operation
+
+The program is designed to remain active indefinitely.
+
+While running, it repeatedly:
+
+```text
+      ┌─────────────────────┐
+      │ Start RFID scanner  │
+      └──────────┬──────────┘
+                 │
+                 ▼
+      ┌─────────────────────┐
+      │ Check for RFID tag  │
+      └──────────┬──────────┘
+                 │
+          Card detected?
+           /           \
+         No             Yes
+         │               │
+         │               ▼
+         │       ┌───────────────┐
+         │       │ Read UID      │
+         │       └───────┬───────┘
+         │               │
+         │               ▼
+         │       ┌───────────────┐
+         │       │ Add timestamp │
+         │       └───────┬───────┘
+         │               │
+         │               ▼
+         │       ┌───────────────┐
+         │       │ Write CSV     │
+         │       └───────┬───────┘
+         │               │
+         └───────────────┘
+                 │
+                 ▼
+          Continue scanning
+```
+
+The scanner only stops when:
 
 ```text
 CTRL+C
 ```
 
-The program will stop the RFID reader and clean up the GPIO/SPI resources.
+is pressed or the process is otherwise terminated.
 
 ---
 
-# 12. Troubleshooting
+# Duplicate Detection
 
-## `/dev/spidev0.0` does not exist
+An RFID reader can detect the same card repeatedly while it remains within range.
 
-Check whether SPI is enabled:
+For example, without protection:
+
+```text
+04:A1:B2:C3
+04:A1:B2:C3
+04:A1:B2:C3
+04:A1:B2:C3
+04:A1:B2:C3
+```
+
+The program therefore uses a cooldown period.
+
+The default is:
+
+```python
+READ_COOLDOWN = 2.0
+```
+
+This means the same UID will not be logged more than once every two seconds.
+
+The value can be changed.
+
+For example:
+
+```python
+READ_COOLDOWN = 5.0
+```
+
+would use a five-second cooldown.
+
+---
+
+# Stopping the Scanner
+
+To stop the program normally:
+
+```text
+CTRL+C
+```
+
+The program will clean up the SPI and GPIO interfaces before exiting.
+
+---
+
+# Troubleshooting
+
+## SPI device does not exist
+
+Run:
+
+```bash
+ls /dev/spidev*
+```
+
+If nothing appears, enable SPI:
 
 ```bash
 sudo raspi-config
 ```
 
-Enable:
+Then:
 
 ```text
 Interface Options → SPI → Enable
 ```
 
-Then reboot.
-
----
-
-## `ModuleNotFoundError: No module named 'spidev'`
-
-Install:
+Reboot:
 
 ```bash
-sudo apt install python3-spidev
+sudo reboot
 ```
 
 ---
 
-## `ModuleNotFoundError: No module named 'RPi'`
+## `No module named 'spidev'`
 
 Install:
 
 ```bash
-sudo apt install python3-rpi.gpio
+sudo apt install -y python3-spidev
+```
+
+Then verify:
+
+```bash
+python3 -c "import spidev; print('spidev OK')"
+```
+
+---
+
+## `No module named 'RPi'`
+
+Install:
+
+```bash
+sudo apt install -y python3-rpi.gpio
+```
+
+Then verify:
+
+```bash
+python3 -c "import RPi.GPIO; print('RPi.GPIO OK')"
 ```
 
 ---
 
 ## RC522 initializes but does not detect cards
 
-Check the wiring carefully.
-
-Particularly verify:
+Check every wire against the following table:
 
 ```text
 VCC  → Pin 1
+RST  → Pin 22
 GND  → Pin 6
 MISO → Pin 21
 MOSI → Pin 19
 SCK  → Pin 23
 SDA  → Pin 24
-RST  → Pin 22
 ```
 
-Also verify that the RC522 is powered by **3.3 V**, not 5 V.
+`IRQ` should remain disconnected.
+
+Also verify that the RC522 is receiving **3.3 V**, not 5 V.
 
 ---
 
-# 13. Current Limitations
+## Program cannot access GPIO
 
-This implementation is intended as a basic RFID scanning system.
+Make sure the program is being run on the Raspberry Pi itself.
 
-It currently records:
+If necessary, test with:
 
-* RFID UID
-* Timestamp
-
-It does not currently provide:
-
-* User/card registration
-* Database storage
-* Authentication
-* Access-control decisions
-* Card names
-* Cardholder information
-* Network synchronization
-* Web interface
-* GUI
-* RFID card writing
-* Automatic startup as a Linux service
-
-These features can be added later without changing the basic SPI wiring.
+```bash
+python3 -c "import RPi.GPIO as GPIO; print(GPIO.VERSION)"
+```
 
 ---
 
-# 14. Future Development
+# Future Improvements
 
-Possible future additions include:
+The current system intentionally provides only the basic RFID scanning functionality.
 
-1. Card registration.
-2. UID-to-user mapping.
-3. SQLite database storage.
-4. Access-control functionality.
-5. Attendance logging.
-6. Web/API integration.
-7. Automatic startup using `systemd`.
-8. Network synchronization.
-9. Multiple RFID readers.
-10. Reader status monitoring.
-11. CSV export.
-12. Centralized logging.
+Possible future improvements include:
 
-The current implementation intentionally keeps the hardware and software stack simple so that the RC522 communication can be verified before adding these features.
+### Card Registration
+
+Associate a UID with a specific person/device:
+
+```text
+04:A1:B2:C3 → Denzel Verster
+```
+
+### Database
+
+Replace CSV storage with:
+
+* SQLite
+* MySQL/MariaDB
+* PostgreSQL
+
+### Attendance System
+
+Record:
+
+```text
+Card UID
+Person
+Date
+Time
+Entry/Exit
+```
+
+### Access Control
+
+Use the UID to determine whether access should be granted:
+
+```text
+RFID Card
+    ↓
+Read UID
+    ↓
+Check registered cards
+    ↓
+ ┌─────────────┐
+ │ Authorized? │
+ └──────┬──────┘
+      Yes / No
+       /     \
+      ▼       ▼
+   Allow     Deny
+```
+
+### Web Interface
+
+Provide a web interface for viewing:
+
+* Registered cards
+* Scan history
+* Users
+* Access events
+* Reader status
+
+### Automatic Startup
+
+Configure the scanner as a `systemd` service so that it automatically starts when the Raspberry Pi boots.
+
+### Network Integration
+
+Send RFID events to another system through:
+
+* REST API
+* MQTT
+* TCP/IP
+* WebSocket
+
+---
+
+# Summary
+
+The complete setup consists of:
+
+**Hardware**
+
+```text
+Raspberry Pi Zero 2 W
+        │
+        │ SPI
+        ▼
+    MFRC522
+        │
+        ▼
+   RFID Card/Tag
+```
+
+**Software**
+
+```text
+Raspberry Pi OS
+       │
+       ▼
+    Python 3
+       │
+   ┌───┴────┐
+   ▼        ▼
+spidev   RPi.GPIO
+   │        │
+   └───┬────┘
+       ▼
+    MFRC522
+       │
+       ▼
+     UID
+       │
+       ▼
+rfid_log.csv
+```
+
+### Minimum installation
+
+For a fresh Raspberry Pi setup, the essential commands are:
+
+```bash
+sudo apt update
+sudo apt install -y python3-spidev python3-rpi.gpio
+```
+
+Enable SPI:
+
+```bash
+sudo raspi-config
+```
+
+Then:
+
+```text
+Interface Options → SPI → Enable
+```
+
+Reboot:
+
+```bash
+sudo reboot
+```
+
+Verify:
+
+```bash
+ls /dev/spidev*
+```
+
+Expected:
+
+```text
+/dev/spidev0.0
+/dev/spidev0.1
+```
+
+Run:
+
+```bash
+cd ~/Scanner-Technology/RFID
+python3 rfid_reader.py
+```
+
+The scanner will then continuously monitor the RC522 and record detected RFID UIDs in `rfid_log.csv`.
